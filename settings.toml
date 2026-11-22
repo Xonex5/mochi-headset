@@ -1,0 +1,9 @@
+# Headset battery: the battery of a USB headset that headsetcontrol knows,
+# like a Logitech PRO X Wireless, on the battery card next to the mouse.
+# Needs headsetcontrol installed and the battery module enabled.
+[module.headset]
+# How often to ask headsetcontrol for the level, in seconds.
+# interval = 30
+# A notice when the headset drops to this level, once until it charges.
+# 0 turns it off.
+# low = 15

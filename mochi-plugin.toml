@@ -1,0 +1,35 @@
+# The headset's battery, from headsetcontrol, on the battery card next to the
+# mouse and the other devices UPower knows. Needs the battery module enabled:
+# the card is its own, with the headset added.
+
+[plugin]
+id = "headset"
+name = "Headset battery"
+version = "0.1.0"
+description = "A USB headset's battery from headsetcontrol, on the battery card"
+api = 1
+
+[backend]
+exec = "bin/headset"
+build = "cargo build --release --locked --target-dir target && install -Dm755 target/release/headset bin/headset"
+needs = ["headsetcontrol"]
+
+[views]
+# The battery card, with the headset under the mouse.
+overrides = ["battery/Card"]
+
+[[actions]]
+name = "status"
+description = "Print each headset's battery level"
+
+[[actions]]
+name = "refresh"
+description = "Read the headset's battery now, without waiting for the next poll"
+
+[settings.interval]
+min = 5
+max = 600
+
+[settings.low]
+min = 0
+max = 100
