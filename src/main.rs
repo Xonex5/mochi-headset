@@ -68,6 +68,9 @@ fn main() -> std::process::ExitCode {
 
 async fn run(mut ctx: ModuleCtx) -> Result<(), mochi_sdk::Error> {
     let settings: Settings = ctx.settings()?;
+    if settings.low > 100 {
+        return Err(format!("low = {} is over 100%", settings.low).into());
+    }
     let interval = Duration::from_secs(settings.interval.max(5));
 
     let (sender, mut readings) = mpsc::unbounded_channel();
@@ -76,6 +79,9 @@ async fn run(mut ctx: ModuleCtx) -> Result<(), mochi_sdk::Error> {
 
     let mut headsets: Vec<Headset> = Vec::new();
     let mut warnings = Warnings::default();
+    // The devices the battery module lists from UPower, by lowercased name.
+    // It sends its own notice for those.
+    let mut upower: HashSet<String> = HashSet::new();
     // Nothing yet: the card shows UPower's devices alone until the first
     // reading.
     ctx.publish_state(state(&headsets, settings.low));
@@ -88,11 +94,17 @@ async fn run(mut ctx: ModuleCtx) -> Result<(), mochi_sdk::Error> {
                 Some(ModuleEvent::Command(command)) => {
                     handle(command, &headsets, &refresh);
                 }
+                Some(ModuleEvent::State { module, state }) if module == "battery" => {
+                    upower = names(&state);
+                }
                 Some(_) => {}
             },
-            Some(reading) = readings.recv() => {
+            Some(output) = readings.recv() => {
+                let reading = parse(&output, &headsets);
                 for headset in warnings.apply(&reading, settings.low) {
-                    notify(&ctx, headset);
+                    if !upower.contains(&headset.name.to_lowercase()) {
+                        notify(&ctx, headset);
+                    }
                 }
                 if reading != headsets {
                     headsets = reading;
@@ -101,6 +113,17 @@ async fn run(mut ctx: ModuleCtx) -> Result<(), mochi_sdk::Error> {
             }
         }
     }
+}
+
+/// The lowercased names of the devices in the battery module's state.
+fn names(state: &Value) -> HashSet<String> {
+    state["devices"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|device| device["name"].as_str())
+        .map(str::to_lowercase)
+        .collect()
 }
 
 fn handle(command: ModuleCommand, headsets: &[Headset], refresh: &Notify) {
@@ -114,13 +137,9 @@ fn handle(command: ModuleCommand, headsets: &[Headset], refresh: &Notify) {
     }
 }
 
-/// Reads the headsets every `interval`, or at once when asked, and sends
-/// each reading until nobody listens.
-async fn poll(
-    sender: mpsc::UnboundedSender<Vec<Headset>>,
-    interval: Duration,
-    refresh: Arc<Notify>,
-) {
+/// Runs `headsetcontrol` every `interval`, or at once when asked, and sends
+/// what it printed until nobody listens.
+async fn poll(sender: mpsc::UnboundedSender<Vec<u8>>, interval: Duration, refresh: Arc<Notify>) {
     loop {
         if sender.send(read().await).is_err() {
             return;
@@ -134,7 +153,7 @@ async fn poll(
 
 /// Runs `headsetcontrol -b -o json`. No program, an error or no answer in
 /// time all mean no headset.
-async fn read() -> Vec<Headset> {
+async fn read() -> Vec<u8> {
     let child = Command::new("headsetcontrol")
         .args(["-b", "-o", "json"])
         .stdin(Stdio::null())
@@ -144,7 +163,7 @@ async fn read() -> Vec<Headset> {
     match tokio::time::timeout(TIMEOUT, child).await {
         // It exits with an error when no headset is plugged in, and prints
         // the JSON all the same.
-        Ok(Ok(output)) => parse(&output.stdout),
+        Ok(Ok(output)) => output.stdout,
         Ok(Err(error)) => {
             eprintln!("headsetcontrol: {error}");
             Vec::new()
@@ -157,8 +176,10 @@ async fn read() -> Vec<Headset> {
 }
 
 /// The headsets with a battery in `headsetcontrol`'s JSON. A headset that's
-/// off reports `BATTERY_UNAVAILABLE`, and is left out.
-fn parse(output: &[u8]) -> Vec<Headset> {
+/// off reports `BATTERY_UNAVAILABLE`, and is left out. Some headsets report
+/// a negative level while charging: they keep their level from `previous`,
+/// or are left out until a reading has one.
+fn parse(output: &[u8], previous: &[Headset]) -> Vec<Headset> {
     let Ok(json) = serde_json::from_slice::<Value>(output) else {
         return Vec::new();
     };
@@ -175,18 +196,22 @@ fn parse(output: &[u8]) -> Vec<Headset> {
                 "BATTERY_CHARGING" => true,
                 _ => return None,
             };
-            let level = battery["level"].as_f64()?.clamp(0.0, 100.0).round() as u32;
             let text = |key: &str| device[key].as_str().unwrap_or_default().trim().to_owned();
+            let id = format!(
+                "headsetcontrol:{}:{}",
+                text("id_vendor"),
+                text("id_product")
+            );
+            let level = match battery["level"].as_f64()? {
+                level if level >= 0.0 => level.min(100.0).round() as u32,
+                _ => previous.iter().find(|headset| headset.id == id)?.level,
+            };
             let name = [text("product"), text("device")]
                 .into_iter()
                 .find(|name| !name.is_empty())
                 .unwrap_or_else(|| "Headset".to_owned());
             Some(Headset {
-                id: format!(
-                    "headsetcontrol:{}:{}",
-                    text("id_vendor"),
-                    text("id_product")
-                ),
+                id,
                 name,
                 level,
                 charging,
@@ -213,7 +238,7 @@ fn state(headsets: &[Headset], low: u32) -> Value {
                 "icon": "headset_mic",
                 "level": headset.level,
                 "charging": headset.charging,
-                "low": low > 0 && headset.low(low),
+                "low": headset.low(low),
                 "left": headset.minutes_left.map(duration),
             }))
             .collect::<Vec<_>>(),
@@ -331,7 +356,7 @@ mod tests {
 
     #[test]
     fn reads_the_pro_x() {
-        let headsets = parse(PRO_X.as_bytes());
+        let headsets = parse(PRO_X.as_bytes(), &[]);
         assert_eq!(
             headsets,
             vec![Headset {
@@ -355,11 +380,18 @@ mod tests {
     #[test]
     fn leaves_out_a_headset_that_is_off() {
         let off = PRO_X.replace("BATTERY_AVAILABLE", "BATTERY_UNAVAILABLE");
-        assert!(parse(off.as_bytes()).is_empty());
-        assert!(parse(b"").is_empty());
-        assert!(parse(br#"{"devices": []}"#).is_empty());
+        assert!(parse(off.as_bytes(), &[]).is_empty());
+        assert!(parse(b"", &[]).is_empty());
+        assert!(parse(br#"{"devices": []}"#, &[]).is_empty());
         let charging = PRO_X.replace("BATTERY_AVAILABLE", "BATTERY_CHARGING");
-        assert!(parse(charging.as_bytes())[0].charging);
+        assert!(parse(charging.as_bytes(), &[])[0].charging);
+        // A negative level while charging keeps the last one, or waits.
+        let unknown = charging.replace("\"level\": 26", "\"level\": -1");
+        assert!(parse(unknown.as_bytes(), &[]).is_empty());
+        let before = parse(PRO_X.as_bytes(), &[]);
+        let now = parse(unknown.as_bytes(), &before);
+        assert_eq!(now[0].level, 26);
+        assert!(now[0].charging);
     }
 
     #[test]

@@ -17,6 +17,8 @@ doesn't report its battery to the kernel.
 - When the headset drops to `low` (15% by default), the island shows a notice
   once, like the battery module does for a mouse. It shows again only after
   the headset charges or climbs 5% above `low`.
+  When UPower lists the same headset, the battery module sends that notice
+  and the plugin stays quiet.
 
 ## Install
 

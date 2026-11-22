@@ -18,6 +18,11 @@ needs = ["headsetcontrol"]
 # The battery card, with the headset under the mouse.
 overrides = ["battery/Card"]
 
+[uses]
+# The battery module already says when a device UPower knows gets low:
+# no second notice for a headset it lists too.
+state = ["battery"]
+
 [[actions]]
 name = "status"
 description = "Print each headset's battery level"
